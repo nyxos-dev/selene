@@ -1274,7 +1274,26 @@ static int sel_is_void_tag(const char* n) {
     return 0;
 }
 
-static void render_html(selene_ctx_t* s, const uint8_t* body, uint32_t len) {
+static int selene_alloc_grids(selene_ctx_t* s) {
+    if (s->lines) return 0;
+    enum { GRID_COUNT = 7 };
+    void* grids[GRID_COUNT];
+    for (int i = 0; i < GRID_COUNT; i++) {
+        grids[i] = kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
+        if (!grids[i]) {
+            while (i > 0) kfree(grids[--i]);
+            return -1;
+        }
+    }
+    // Publish all grids together: a failed first render leaves the tab retryable.
+    s->lines = grids[0]; s->link_of = grids[1]; s->field_of = grids[2];
+    s->img_of = grids[3]; s->color_of = grids[4];
+    s->bgcolor_of = grids[5]; s->bold_of = grids[6];
+    return 0;
+}
+
+static int render_html(selene_ctx_t* s, const uint8_t* body, uint32_t len) {
+    if (selene_alloc_grids(s) < 0) return -1;
     s->num_lines = 0; s->scroll = 0; s->title[0] = '\0';
     s->num_links = 0; s->sel_link = -1;
     s->num_fields = 0; s->num_forms = 0; s->sel_field = -1;
@@ -1291,7 +1310,7 @@ static void render_html(selene_ctx_t* s, const uint8_t* body, uint32_t len) {
     __builtin_memset(s->line_align, 0, SEL_MAX_LINES);
     __builtin_memset(s->line_rule, 0, SEL_MAX_LINES);
     s->num_cell_boxes = 0;                                   // in-cell bordered-<div> outlines, collected by render_table this render
-    if (!body || !len) { s->num_lines = 0; return; }
+    if (!body || !len) { s->num_lines = 0; return 0; }
     char*    txt    = (char*)kmalloc(len + 1);
     uint8_t* tlink  = (uint8_t*)kmalloc(len + 1);
     uint8_t* tfield = (uint8_t*)kmalloc(len + 1);
@@ -1315,7 +1334,7 @@ static void render_html(selene_ctx_t* s, const uint8_t* body, uint32_t len) {
         if (trule) kfree(trule);
         if (tindent) kfree(tindent);
         if (colstk) kfree(colstk);
-        return;
+        return -1;
     }
     __builtin_memset(tfield,  0, len + 1);
     __builtin_memset(timg,    0, len + 1);
@@ -2247,6 +2266,7 @@ static void render_html(selene_ctx_t* s, const uint8_t* body, uint32_t len) {
     } else s->num_cell_boxes = 0;                                // no map -> no in-cell boxes this render
     kfree(txt); kfree(tlink); kfree(tfield); kfree(timg); kfree(tcolor); kfree(tbgcol); kfree(tbold); kfree(talign); kfree(trule); kfree(tindent);
     kfree(colstk);
+    return 0;
 }
 
 // Parse http[://]host[:port][/path] into host/port/path (same shape as `httpget`).
@@ -2335,8 +2355,8 @@ static int selene_next_img_index(selene_ctx_t* s, int rows) {
 
 // Fetch + decode AT MOST ONE visible, not-yet-tried image. Returns 1 if it fetched one (the caller
 // should redraw to pop it in), 0 if none are pending. Driven once per compositor tick by
-// selene_win_tick so image loading never freezes the browser: the page shows instantly and images
-// stream in one per frame, with scrolling / clicks / tab switches handled in between.
+// selene_win_tick. This bounds attempts per tick, not latency: each request is synchronous
+// and can block input until it returns.
 static int selene_fetch_next(selene_ctx_t* s, int iface) {
     if (iface < 0) return 0;
     int i = selene_next_img_index(s, visible_rows());
@@ -2376,7 +2396,7 @@ static int selene_anim_tick(selene_ctx_t* s) {
 }
 
 // Compositor ~30fps tick for a Selene window: (1) advance any on-screen animated GIF, then (2)
-// cooperatively load one pending image — so neither animation nor a slow fetch freezes the UI.
+// load one pending image. A slow synchronous fetch still delays the next UI dispatch.
 // Returns 1 (redraw) when it changed something this tick, 0 when idle.
 int selene_win_tick(window_t* win) {
     selene_tabs_t* T = (selene_tabs_t*)win->reserved;
@@ -2384,7 +2404,7 @@ int selene_win_tick(window_t* win) {
     selene_ctx_t* s = T->tab[T->active];
     if (!s) return 0;
     int changed = selene_anim_tick(s);                          // animate first (cheap, no I/O)
-    if (selene_fetch_next(s, find_iface())) changed = 1;        // then fetch one pending image (may block briefly)
+    if (selene_fetch_next(s, find_iface())) changed = 1;
     return changed;
 }
 
@@ -2465,7 +2485,12 @@ static void selene_load_ex(selene_ctx_t* s, const char* method, const uint8_t* b
         break;   // final response: not a redirect, no Location, unresolvable, or the hop cap was reached
     }
 
-    render_html(s, resp->body, resp->body_len);
+    if (render_html(s, resp->body, resp->body_len) < 0) {
+        http_free(resp);
+        strncpy(s->status, "Out of memory: page not rendered", sizeof(s->status) - 1);
+        compositor_redraw_now();
+        return;
+    }
     strncpy(s->cur_url, s->url, sizeof(s->cur_url)-1); s->cur_url[sizeof(s->cur_url)-1] = '\0';
     snprintf(s->status, sizeof(s->status), "%d %s  -  %s  -  %d links",
              resp->status_code, resp->status_text,
@@ -2646,30 +2671,15 @@ static selene_ctx_t* selene_new_ctx(void) {
     selene_ctx_t* s = (selene_ctx_t*)kmalloc(sizeof(selene_ctx_t));
     if (!s) return NULL;
     __builtin_memset(s, 0, sizeof(*s));
-    s->lines    = (char(*)[SEL_LINE_COLS])kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
-    s->link_of  = (uint8_t(*)[SEL_LINE_COLS])kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
-    s->field_of = (uint8_t(*)[SEL_LINE_COLS])kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
     s->links    = (sel_link_t*)kmalloc(SEL_MAX_LINKS * sizeof(sel_link_t));
     s->fields   = (sel_field_t*)kmalloc(SEL_MAX_FIELDS * sizeof(sel_field_t));
     s->forms    = (sel_form_t*)kmalloc(SEL_MAX_FORMS * sizeof(sel_form_t));
-    s->img_of   = (uint8_t(*)[SEL_LINE_COLS])kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
     s->images   = (sel_img_t*)kmalloc(SEL_MAX_IMGS * sizeof(sel_img_t));
-    s->color_of = (uint8_t(*)[SEL_LINE_COLS])kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
-    s->bgcolor_of = (uint8_t(*)[SEL_LINE_COLS])kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
-    s->bold_of  = (uint8_t(*)[SEL_LINE_COLS])kmalloc(SEL_MAX_LINES * SEL_LINE_COLS);
-    if (!s->lines || !s->link_of || !s->field_of || !s->links || !s->fields || !s->forms ||
-        !s->img_of || !s->images || !s->color_of || !s->bgcolor_of || !s->bold_of) {
-        if (s->lines) kfree(s->lines);
-        if (s->link_of) kfree(s->link_of);
-        if (s->field_of) kfree(s->field_of);
+    if (!s->links || !s->fields || !s->forms || !s->images) {
         if (s->links) kfree(s->links);
         if (s->fields) kfree(s->fields);
         if (s->forms) kfree(s->forms);
-        if (s->img_of) kfree(s->img_of);
         if (s->images) kfree(s->images);
-        if (s->color_of) kfree(s->color_of);
-        if (s->bgcolor_of) kfree(s->bgcolor_of);
-        if (s->bold_of) kfree(s->bold_of);
         kfree(s); return NULL;
     }
     s->sel_field = -1;
@@ -2762,8 +2772,9 @@ void selene_first_load(window_t* win) {
         "<p>Ctrl+T opens a tab. Ctrl+F searches the current page.</p>"
         "</body></html>";
     selene_ctx_t* s = T->tab[T->active];
-    render_html(s, page, sizeof(page) - 1);
-    strncpy(s->status, "Ready - type a URL and press Enter", sizeof(s->status) - 1);
+    int rendered = render_html(s, page, sizeof(page) - 1);
+    strncpy(s->status, rendered < 0 ? "Out of memory: page not rendered" :
+            "Ready - type a URL and press Enter", sizeof(s->status) - 1);
 }
 
 int selene_start_selftest(void) {
@@ -2771,10 +2782,14 @@ int selene_start_selftest(void) {
     win.reserved = selene_create_ctx();
     if (!win.reserved) return 1;
     selene_tabs_t* T = (selene_tabs_t*)win.reserved;
+    int lazy = !T->tab[0]->lines && !T->tab[0]->link_of && !T->tab[0]->field_of &&
+               !T->tab[0]->img_of && !T->tab[0]->color_of && !T->tab[0]->bgcolor_of &&
+               !T->tab[0]->bold_of;
     selene_first_load(&win);     // must render without a network interface or fetch
     selene_ctx_t* s = T->tab[0];
     int rc = 0;
-    if (s->num_lines <= 0 || strcmp(s->title, "Welcome to Selene")) rc = 2;
+    if (!lazy) rc = 6;
+    else if (s->num_lines <= 0 || strcmp(s->title, "Welcome to Selene")) rc = 2;
     else if (strcmp(s->url, "example.com") || s->cur_url[0] || s->hist_len) rc = 3;
     else if (s->num_imgs || s->num_links) rc = 4;
     selene_win_close(&win);
@@ -3399,7 +3414,7 @@ int selene_form_selftest(void) {
         "<input type=\"hidden\" name=\"lang\" value=\"en\">"
         "<input type=\"submit\" value=\"Search\">"
         "</form>";
-    render_html(s, (const uint8_t*)HTML, (uint32_t)strlen(HTML));
+    if (render_html(s, (const uint8_t*)HTML, (uint32_t)strlen(HTML)) < 0) goto render_failed;
 
     total++;
     if (s->num_forms == 1 && s->forms[0].method == 0 && sel_streq(s->forms[0].action, "http://example.com/search"))
@@ -3429,7 +3444,7 @@ int selene_form_selftest(void) {
             "<input type=\"text\" name=\"user\" value=\"\">"
             "<input type=\"password\" name=\"pass\" value=\"\">"
             "<input type=\"submit\" value=\"Sign in\"></form>";
-        render_html(s, (const uint8_t*)PHTML, (uint32_t)strlen(PHTML));
+        if (render_html(s, (const uint8_t*)PHTML, (uint32_t)strlen(PHTML)) < 0) goto render_failed;
         int okp = (s->num_forms == 1 && s->forms[0].method == 1 && s->num_fields == 3);   // method POST
         if (okp) {
             strncpy(s->fields[0].value, "alice",  sizeof(s->fields[0].value)-1);
@@ -3448,7 +3463,7 @@ int selene_form_selftest(void) {
         static const char* IHTML =
             "<p>Logo <img src=\"/logo.png\" alt=\"Company Logo\"> here</p>"
             "<img src=\"http://cdn.example/cat.jpg\">";
-        render_html(s, (const uint8_t*)IHTML, (uint32_t)strlen(IHTML));
+        if (render_html(s, (const uint8_t*)IHTML, (uint32_t)strlen(IHTML)) < 0) goto render_failed;
         int oki = (s->num_imgs == 2 &&
                    sel_streq(s->images[0].alt, "Company Logo") && sel_streq(s->images[0].src, "/logo.png") &&
                    s->images[1].alt[0] == '\0' && sel_streq(s->images[1].src, "http://cdn.example/cat.jpg"));
@@ -3475,7 +3490,7 @@ int selene_form_selftest(void) {
             "<tr><td>Alice</td><td>30</td></tr>"
             "<tr><td>Bob</td><td>5</td></tr>"
             "</table>";
-        render_html(s, (const uint8_t*)THTML, (uint32_t)strlen(THTML));
+        if (render_html(s, (const uint8_t*)THTML, (uint32_t)strlen(THTML)) < 0) goto render_failed;
         int hdr = 0, r1 = 0, r2 = 0, rule = 0;                            // exact aligned lines expected
         for (int li = 0; li < s->num_lines; li++) {
             const char* L = s->lines[li];
@@ -3537,15 +3552,12 @@ int selene_form_selftest(void) {
     total++;
     {
         static const char* EH = "<p>A&mdash;B&hellip;C&copy;D&amp;E&nbsp;F&middot;G&#8212;H</p>";
-        static const char* WANT = "A--B...C(c)D&E F*G--H";
-        render_html(s, (const uint8_t*)EH, (uint32_t)strlen(EH));
+        static const char* WANT = "A--B...C(c)D&E\xff" "F*G--H";
+        if (render_html(s, (const uint8_t*)EH, (uint32_t)strlen(EH)) < 0) goto render_failed;
         int found = 0;
         for (int li = 0; li < s->num_lines && !found; li++) {
             const char* L = s->lines[li];
-            for (int off = 0; L[off]; off++) {                       // substring search (ignore any padding)
-                int m = 1; for (int q = 0; WANT[q]; q++) if (L[off + q] != WANT[q]) { m = 0; break; }
-                if (m) { found = 1; break; }
-            }
+            if (strstr(L, WANT)) found = 1;
         }
         if (found) { pass++; printf("selene-form: HTML entities (mdash/hellip/copy/amp/nbsp/middot/#8212) PASS\n"); }
         else printf("selene-form: HTML entities FAIL\n");
@@ -3575,14 +3587,14 @@ int selene_form_selftest(void) {
     total++;
     {
         static const char* T1 = "<table><tr><th colspan=\"2\">Group</th></tr><tr><td>A</td><td>B</td></tr></table>";
-        render_html(s, (const uint8_t*)T1, (uint32_t)strlen(T1));
+        if (render_html(s, (const uint8_t*)T1, (uint32_t)strlen(T1)) < 0) goto render_failed;
         int cspan_ok = 0, data_ok = 0;
         for (int li = 0; li < s->num_lines; li++) {
             if (sel_streq(s->lines[li], "| GROUP |")) cspan_ok = 1;   // <th> is upper-cased, spanning both cols
             if (sel_streq(s->lines[li], "| A | B |")) data_ok = 1;
         }
         static const char* T2 = "<table><tr><td rowspan=\"2\">R</td><td>x</td></tr><tr><td>y</td></tr></table>";
-        render_html(s, (const uint8_t*)T2, (uint32_t)strlen(T2));
+        if (render_html(s, (const uint8_t*)T2, (uint32_t)strlen(T2)) < 0) goto render_failed;
         int rspan_ok = 0;
         for (int li = 0; li < s->num_lines; li++) if (sel_streq(s->lines[li], "|   | y |")) rspan_ok = 1;  // y aligned in col 1
         if (cspan_ok && data_ok && rspan_ok)
@@ -3590,9 +3602,7 @@ int selene_form_selftest(void) {
         else printf("selene-form: table span FAIL (cspan=%d data=%d rspan=%d)\n", cspan_ok, data_ok, rspan_ok);
     }
 
-    // 12) nested <table>: a table inside a cell renders inline as a compact "[ a b / c d ]" (cells
-    // space-separated, rows by " / ") and does NOT corrupt the outer grid — the outer data row keeps
-    // exactly its 2 columns and the inner rows never leak in as extra outer rows/columns.
+    // 12) Nested rows occupy successive lines of one outer cell with aligned borders.
     total++;
     {
         static const char* NT =
@@ -3601,19 +3611,22 @@ int selene_form_selftest(void) {
             "<tr><td>Row1</td>"
             "<td><table><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table></td></tr>"
             "</table>";
-        render_html(s, (const uint8_t*)NT, (uint32_t)strlen(NT));
+        if (render_html(s, (const uint8_t*)NT, (uint32_t)strlen(NT)) < 0) goto render_failed;
         int hdr_ok = 0, nest_ok = 0, cols_ok = 0;
         for (int li = 0; li < s->num_lines; li++) {
             const char* L = s->lines[li];
             if (strstr(L, "ITEM") && strstr(L, "DETAIL")) hdr_ok = 1;              // header row intact
-            if (strstr(L, "Row1") && strstr(L, "[ A B / C D ]")) {                 // nested table inline, same row
-                nest_ok = 1;
-                int pipes = 0; for (int q = 0; L[q]; q++) if (L[q] == '|') pipes++;
-                if (pipes == 3) cols_ok = 1;                                       // exactly 2 columns (3 borders)
+            if (sel_streq(L, "| Row1 | A B           |") && li + 1 < s->num_lines) {
+                const char* next = s->lines[li + 1];
+                nest_ok = sel_streq(next, "|      | C D           |");
+                int pipes = 0, next_pipes = 0;
+                for (int q = 0; L[q]; q++) if (L[q] == '|') pipes++;
+                for (int q = 0; next[q]; q++) if (next[q] == '|') next_pipes++;
+                cols_ok = pipes == 3 && next_pipes == 3;
             }
         }
         if (hdr_ok && nest_ok && cols_ok)
-            { pass++; printf("selene-form: nested <table> (inline flatten + outer grid intact) PASS\n"); }
+            { pass++; printf("selene-form: nested <table> (aligned rows + outer grid intact) PASS\n"); }
         else printf("selene-form: nested table FAIL (hdr=%d nest=%d cols=%d)\n", hdr_ok, nest_ok, cols_ok);
     }
 
@@ -3622,7 +3635,7 @@ int selene_form_selftest(void) {
     total++;
     {
         static const char* OL = "<ol><li>First</li><li>Second</li><li>Third</li></ol>";
-        render_html(s, (const uint8_t*)OL, (uint32_t)strlen(OL));
+        if (render_html(s, (const uint8_t*)OL, (uint32_t)strlen(OL)) < 0) goto render_failed;
         int n1 = 0, n2 = 0, n3 = 0;
         for (int li = 0; li < s->num_lines; li++) {
             if (sel_streq(s->lines[li], "1. First"))  n1 = 1;
@@ -3630,13 +3643,13 @@ int selene_form_selftest(void) {
             if (sel_streq(s->lines[li], "3. Third"))  n3 = 1;
         }
         static const char* NL = "<ul><li>A<ol><li>one</li><li>two</li></ol></li><li>B</li></ul>";
-        render_html(s, (const uint8_t*)NL, (uint32_t)strlen(NL));
+        if (render_html(s, (const uint8_t*)NL, (uint32_t)strlen(NL)) < 0) goto render_failed;
         int pa = 0, c1 = 0, c2 = 0, pb = 0;
         for (int li = 0; li < s->num_lines; li++) {
-            if (sel_streq(s->lines[li], "- A"))      pa = 1;   // unordered parent marker
+            if (sel_streq(s->lines[li], "\xf9" " A")) pa = 1;
             if (sel_streq(s->lines[li], "  1. one")) c1 = 1;   // nested ordered item, indented 2
             if (sel_streq(s->lines[li], "  2. two")) c2 = 1;
-            if (sel_streq(s->lines[li], "- B"))      pb = 1;   // parent numbering/marker resumes at col 0
+            if (sel_streq(s->lines[li], "\xf9" " B")) pb = 1;
         }
         if (n1 && n2 && n3 && pa && c1 && c2 && pb)
             { pass++; printf("selene-form: ordered + nested lists (numbered <ol> + indented nesting) PASS\n"); }
@@ -3648,17 +3661,17 @@ int selene_form_selftest(void) {
     total++;
     {
         static const char* PRE = "<pre>a  b\n  c</pre>";               // 2 spaces mid-line, 2 leading on line 2
-        render_html(s, (const uint8_t*)PRE, (uint32_t)strlen(PRE));
+        if (render_html(s, (const uint8_t*)PRE, (uint32_t)strlen(PRE)) < 0) goto render_failed;
         int p1 = 0, p2 = 0;
         for (int li = 0; li < s->num_lines; li++) {
             if (sel_streq(s->lines[li], "a  b")) p1 = 1;               // interior double space kept
             if (sel_streq(s->lines[li], "  c"))  p2 = 1;               // leading indent kept
         }
         static const char* BQ = "<blockquote>Quoted text here</blockquote>";
-        render_html(s, (const uint8_t*)BQ, (uint32_t)strlen(BQ));
+        if (render_html(s, (const uint8_t*)BQ, (uint32_t)strlen(BQ)) < 0) goto render_failed;
         int q1 = 0;
         for (int li = 0; li < s->num_lines; li++)
-            if (sel_streq(s->lines[li], "    Quoted text here")) q1 = 1;  // 4-space left margin
+            if (sel_streq(s->lines[li], "\xb3" "   Quoted text here")) q1 = 1;
         if (p1 && p2 && q1)
             { pass++; printf("selene-form: <pre> whitespace + <blockquote> indent PASS\n"); }
         else printf("selene-form: pre/blockquote FAIL (pre a  b=%d, pre indent=%d, quote=%d)\n", p1, p2, q1);
@@ -3667,4 +3680,9 @@ int selene_form_selftest(void) {
     selene_free_ctx(s);
     printf("selene-form: self-test %d/%d passed\n", pass, total);
     return (pass == total) ? 0 : -1;
+
+render_failed:
+    selene_free_ctx(s);
+    printf("selene-form: render allocation failed\n");
+    return -1;
 }
